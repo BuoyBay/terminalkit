@@ -1,0 +1,47 @@
+{
+  "schema": 2,
+  "target": "arm64-darwin",
+  "source_digest": "589689547723c79575ed06801e712113923f2ef8ffd2f04d62522d3fabcb19a4",
+  "recipe_digest": "6491004184d2ebc3ed4ed2b868cd62793f76269bf60e2ab436e1f60cc121d296",
+  "binary_digest": "ea11ced2c3f0e4a603ad1237000011ed999dbc13c4b0dc63165236ace227d351",
+  "compiler": {
+    "path": "/usr/bin/clang",
+    "sha256": "ed6f5284033aa2aae6a58427c25ba3ab119947b40365627b24e5d51a4b70a1cd"
+  },
+  "command": [
+    "/usr/bin/clang",
+    "-std=c11",
+    "-O2",
+    "-Wall",
+    "-Wextra",
+    "-Werror",
+    "-pthread",
+    "-fPIC",
+    "-dynamiclib",
+    "-arch",
+    "arm64",
+    "-mmacosx-version-min=11.0",
+    "-Wl,-install_name,@rpath/libbuoy_terminalkit.dylib",
+    "/private/tmp/buoy-package-restore-20261101/tree/libraries/terminalkit/native/bridge.c",
+    "-o",
+    "/private/tmp/buoy-package-restore-20261101/tree/libraries/terminalkit/runtime/arm64-apple-macos/libbuoy_terminalkit.dylib",
+    "-lproc"
+  ],
+  "compiler_arguments": [
+    "/usr/bin/clang"
+  ],
+  "build_host": "arm64-darwin",
+  "builder_machine": "6bb2148aba28d27e3891ca9556f1786b7386e590381322fd5c567eebe3b289c0",
+  "environment": {
+    "CC": null,
+    "SDKROOT": "/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX.sdk",
+    "MACOSX_DEPLOYMENT_TARGET": null,
+    "INCLUDE": null,
+    "LIB": null,
+    "LIBPATH": null,
+    "CPATH": "/usr/local/include",
+    "C_INCLUDE_PATH": null,
+    "CPLUS_INCLUDE_PATH": null,
+    "LIBRARY_PATH": "/usr/local/lib"
+  }
+}

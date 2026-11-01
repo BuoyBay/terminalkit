@@ -1,0 +1,544 @@
+Private Declare Function TNew Lib "buoy_terminalkit" Alias "btk_new" () As Ptr
+Private Declare Function TStart Lib "buoy_terminalkit" Alias "btk_start" (handle As Ptr, shell As String, cwd As String, columns As Integer, rows As Integer) As Integer
+Private Declare Function TError Lib "buoy_terminalkit" Alias "btk_error" (handle As Ptr) As String
+Private Declare Function TPoll Lib "buoy_terminalkit" Alias "btk_poll" (handle As Ptr) As Integer
+Private Declare Function TExit Lib "buoy_terminalkit" Alias "btk_exit" (handle As Ptr) As Integer
+Private Declare Function TRead Lib "buoy_terminalkit" Alias "btk_read" (handle As Ptr, buffer As Ptr, capacity As Integer) As Integer
+Private Declare Function TWrite Lib "buoy_terminalkit" Alias "btk_write" (handle As Ptr, buffer As Ptr, count As Integer) As Integer
+Private Declare Function TResize Lib "buoy_terminalkit" Alias "btk_resize" (handle As Ptr, columns As Integer, rows As Integer) As Integer
+Private Declare Sub TClose Lib "buoy_terminalkit" Alias "btk_close" (handle As Ptr)
+Private Declare Function TAlloc Lib "buoy_terminalkit" Alias "btk_alloc" (size As Integer) As Ptr
+Private Declare Sub TFree Lib "buoy_terminalkit" Alias "btk_free" (buffer As Ptr)
+
+Private Sub TerminalText(value As String)
+    Dim encoded As Bytes = Bytes.FromString(value, Text.Encodings.UTF8)
+    For i As Integer = 0 To encoded.Count - 1
+        Dim n As Integer = encoded.Item(i)
+        If n = 0 Then Throw New InvalidArgumentException("Terminal path contains NUL")
+    Next
+End Sub
+
+''' A real PTY (POSIX) or ConPTY (Windows 10 1809+) session. One main-thread owner.
+Public Class TerminalSession
+    Private Property Handle As Ptr
+    Public Sub Constructor(shell As String, cwd As String, columns As Integer = 100, rows As Integer = 30)
+        TerminalText(shell)
+        TerminalText(cwd)
+        If shell = "" Then Throw New InvalidArgumentException("Terminal shell executable path is required")
+        If columns < 2 Or columns > 500 Or rows < 2 Or rows > 300 Then Throw New InvalidArgumentException("Terminal dimensions out of range")
+        Me.Handle = TNew()
+        If Me.Handle = Nil Then Throw New Exception("Cannot allocate terminal")
+        If TStart(Me.Handle, shell, cwd, columns, rows) = 0 Then
+            Dim message As String = TError(Me.Handle)
+            Me.Close()
+            Throw New Exception(message)
+        End If
+    End Sub
+    Public Function Poll() As Boolean
+        If Me.Handle = Nil Then Return False
+        Dim state As Integer = TPoll(Me.Handle)
+        If state < 0 Then Throw New Exception(TError(Me.Handle))
+        Return state = 1
+    End Function
+    Public Property ExitCode As Integer
+        Get
+            If Me.Handle = Nil Then Throw New InvalidArgumentException("Terminal is closed")
+            If Me.Poll() Then Throw New InvalidArgumentException("Terminal is still running")
+            Return TExit(Me.Handle)
+        End Get
+    End Property
+    Public Function Read() As Bytes
+        If Me.Handle = Nil Then Return New Bytes()
+        Dim buffer As Ptr = TAlloc(65536)
+        If buffer = Nil Then Throw New Exception("Cannot allocate terminal read buffer")
+        Try
+            Dim count As Integer = TRead(Me.Handle, buffer, 65536)
+            If count < 0 Then Throw New Exception(TError(Me.Handle))
+            Dim data As New Bytes()
+            If count > 0 Then data.Append(buffer, count)
+            Return data
+        Finally
+            TFree(buffer)
+        End Try
+    End Function
+    ''' Nonblocking partial acceptance. The caller retains and retries the remainder.
+    Public Function Write(data As Bytes) As Integer
+        If Me.Handle = Nil Then Throw New InvalidArgumentException("Terminal is closed")
+        If data = Nil Or data.Count > 65536 Then Throw New InvalidArgumentException("Terminal input must be at most 65536 bytes")
+        If data.Count = 0 Then Return 0
+        Dim count As Integer = TWrite(Me.Handle, data.DataPtr(), data.Count)
+        If count < 0 Then Throw New Exception(TError(Me.Handle))
+        Return count
+    End Function
+    Public Sub Resize(columns As Integer, rows As Integer)
+        If Me.Handle = Nil Then Return
+        If TResize(Me.Handle, columns, rows) = 0 Then Throw New Exception("Cannot resize terminal")
+    End Sub
+    Public Sub Close()
+        If Me.Handle <> Nil Then TClose(Me.Handle)
+        Me.Handle = Nil
+    End Sub
+    Public Sub Destructor()
+        Me.Close()
+    End Sub
+End Class
+
+Public Class TerminalCell
+    Public Property Text As String = " "
+    Public Property Foreground As Integer = 7
+    Public Property Background As Integer = 0
+End Class
+
+Private Class TerminalHistoryRow
+    Public Property Cells As Array Of TerminalCell = []
+End Class
+
+''' Bounded ANSI/VT screen, UTF-8 decoded across reads; OSC data is ignored, never executed.
+''' Supports cursor motion, erase, scroll regions, alternate screen and 16/256/RGB colours.
+Public Class TerminalScreen
+    Public Property Columns As Integer = 100
+    Public Property Rows As Integer = 30
+    Public Property CursorX As Integer = 0
+    Public Property CursorY As Integer = 0
+    Public Property CursorVisible As Boolean = True
+    Public Property Cells As Array Of TerminalCell = []
+    Public Property Foreground As Integer = 7
+    Public Property Background As Integer = 0
+    Public Property ApplicationCursor As Boolean = False
+    Public Property BracketedPaste As Boolean = False
+    Private Property Replies As String = ""
+    Private Property State As Integer = 0
+    Private Property Sequence As String = ""
+    Private Property UTFCode As Integer = 0
+    Private Property UTFLeft As Integer = 0
+    Private Property UTFMinimum As Integer = 0
+    Private Property SavedX As Integer = 0
+    Private Property SavedY As Integer = 0
+    Private Property ScrollTop As Integer = 0
+    Private Property ScrollBottom As Integer = 29
+    Private Property Alternate As Array Of TerminalCell = []
+    Private Property AlternateX As Integer = 0
+    Private Property AlternateY As Integer = 0
+    Private Property Wrapped As Boolean = False
+    ' Ring of complete primary-screen rows; stored widths survive a resize.
+    Private Property History As Array Of TerminalHistoryRow = []
+    Private Property HistoryHead As Integer = 0
+    Private Property ViewOffset As Integer = 0
+    Public Const HistoryCapacity As Integer = 2000
+
+    Public Property HistoryCount As Integer
+        Get
+            Return Array.Count(Me.History)
+        End Get
+    End Property
+    Public Property ScrollOffset As Integer
+        Get
+            If Me.AlternateScreen Then Return 0
+            Return Me.ViewOffset
+        End Get
+    End Property
+    Public Property AlternateScreen As Boolean
+        Get
+            Return Array.Count(Me.Alternate) > 0
+        End Get
+    End Property
+    ' Positive lines move toward newer output; negative lines reveal history.
+    Public Sub ScrollBy(lines As Integer)
+        If Me.AlternateScreen Then Return
+        Me.ViewOffset = Math.Max(0, Math.Min(Me.HistoryCount, Me.ViewOffset - lines))
+    End Sub
+    Public Sub FollowOutput()
+        Me.ViewOffset = 0
+    End Sub
+    Public Sub ClearHistory()
+        Me.History = []
+        Me.HistoryHead = 0
+        Me.ViewOffset = 0
+    End Sub
+    Public Function VisibleCell(column As Integer, row As Integer) As TerminalCell
+        If column < 0 Or column >= Me.Columns Or row < 0 Or row >= Me.Rows Then Throw New InvalidArgumentException("Terminal cell out of bounds")
+        Dim sourceRow As Integer = row - Me.ScrollOffset
+        If sourceRow >= 0 Then Return Me.Cells(sourceRow * Me.Columns + column)
+        Dim index As Integer = (Me.HistoryHead + Me.HistoryCount + sourceRow) Mod Me.HistoryCount
+        Dim cells As Array Of TerminalCell = Me.History(index).Cells
+        If column < Array.Count(cells) Then Return cells(column)
+        Return New TerminalCell()
+    End Function
+    Private Sub RememberRow()
+        Dim row As New TerminalHistoryRow()
+        For x As Integer = 0 To Me.Columns - 1
+            row.Cells.Append(Me.Cells(x))
+        Next
+        If Me.HistoryCount < TerminalScreen.HistoryCapacity Then
+            Me.History.Append(row)
+        Else
+            Me.History(Me.HistoryHead) = row
+            Me.HistoryHead = (Me.HistoryHead + 1) Mod TerminalScreen.HistoryCapacity
+        End If
+        If Me.ViewOffset > 0 Then Me.ViewOffset = Math.Min(Me.HistoryCount, Me.ViewOffset + 1)
+    End Sub
+
+    Public Sub Constructor(columns As Integer = 100, rows As Integer = 30)
+        Me.Resize(columns, rows)
+    End Sub
+    Public Sub Resize(columns As Integer, rows As Integer)
+        If columns < 2 Or columns > 500 Or rows < 2 Or rows > 300 Then Throw New InvalidArgumentException("Terminal dimensions out of range")
+        Dim cells As Array Of TerminalCell = []
+        For y As Integer = 0 To rows - 1
+            For x As Integer = 0 To columns - 1
+                Dim cell As New TerminalCell()
+                If y < Me.Rows And x < Me.Columns And Array.Count(Me.Cells) = Me.Columns * Me.Rows Then cell = Me.Cells(y * Me.Columns + x)
+                Array.Append(cells, cell)
+            Next
+        Next
+        ' Keep the primary screen while a full-screen program is being resized.
+        If Me.AlternateScreen Then
+            Dim primary As Array Of TerminalCell = []
+            For y As Integer = 0 To rows - 1
+                For x As Integer = 0 To columns - 1
+                    Dim cell As New TerminalCell()
+                    If y < Me.Rows And x < Me.Columns Then cell = Me.Alternate(y * Me.Columns + x)
+                    primary.Append(cell)
+                Next
+            Next
+            Me.Alternate = primary
+            Me.AlternateX = Math.Min(Me.AlternateX, columns - 1)
+            Me.AlternateY = Math.Min(Me.AlternateY, rows - 1)
+        End If
+        Me.Cells = cells
+        Me.Columns = columns
+        Me.Rows = rows
+        Me.ScrollTop = 0
+        Me.ScrollBottom = rows - 1
+        Me.CursorX = Math.Min(Me.CursorX, columns - 1)
+        Me.CursorY = Math.Min(Me.CursorY, rows - 1)
+        Me.Wrapped = False
+        Me.SavedX = Math.Min(Me.SavedX, columns - 1)
+        Me.SavedY = Math.Min(Me.SavedY, rows - 1)
+    End Sub
+    Public Function Line(row As Integer) As String
+        If row < 0 Or row >= Me.Rows Then Throw New InvalidArgumentException("Terminal row out of bounds")
+        Dim text As String = ""
+        For x As Integer = 0 To Me.Columns - 1
+            text += Me.Cells(row * Me.Columns + x).Text
+        Next
+        Return text
+    End Function
+    Private Sub Erase(first As Integer, last As Integer)
+        For i As Integer = Math.Max(0, first) To Math.Min(Array.Count(Me.Cells) - 1, last)
+            Dim cell As New TerminalCell()
+            cell.Foreground = Me.Foreground
+            cell.Background = Me.Background
+            Me.Cells(i) = cell
+        Next
+    End Sub
+    Private Sub Scroll(up As Boolean)
+        Dim first As Integer = Me.ScrollTop * Me.Columns
+        Dim last As Integer = (Me.ScrollBottom + 1) * Me.Columns - 1
+        If up Then
+            If Me.ScrollTop = 0 And Me.ScrollBottom = Me.Rows - 1 And Not Me.AlternateScreen Then Me.RememberRow()
+            For i As Integer = first To last - Me.Columns
+                Me.Cells(i) = Me.Cells(i + Me.Columns)
+            Next
+            Me.Erase(last - Me.Columns + 1, last)
+        Else
+            For i As Integer = last To first + Me.Columns Step -1
+                Me.Cells(i) = Me.Cells(i - Me.Columns)
+            Next
+            Me.Erase(first, first + Me.Columns - 1)
+        End If
+    End Sub
+    Private Sub NewLine()
+        Me.Wrapped = False
+        If Me.CursorY = Me.ScrollBottom Then
+            Me.Scroll(True)
+        Else
+            Me.CursorY = Math.Min(Me.Rows - 1, Me.CursorY + 1)
+        End If
+    End Sub
+    Private Sub Put(code As Integer)
+        If Me.Wrapped Then
+            Me.CursorX = 0
+            Me.NewLine()
+        End If
+        Dim cell As New TerminalCell()
+        cell.Text = String.Chr(code)
+        cell.Foreground = Me.Foreground
+        cell.Background = Me.Background
+        Me.Cells(Me.CursorY * Me.Columns + Me.CursorX) = cell
+        If Me.CursorX = Me.Columns - 1 Then
+            Me.Wrapped = True
+        Else
+            Me.CursorX += 1
+        End If
+    End Sub
+    Private Function Parameter(values As Array Of String, index As Integer, fallback As Integer) As Integer
+        If index >= Array.Count(values) Then Return fallback
+        Dim parsed As Integer = Integer.Parse(values(index)).Or(fallback)
+        If parsed <= 0 Then Return fallback
+        Return Math.Min(10000, Math.Max(0, parsed))
+    End Function
+    Public Function TakeReplies() As String
+        Dim content As String = Me.Replies
+        Me.Replies = ""
+        Return content
+    End Function
+    Private Sub CSI(terminator As Integer)
+        Dim body As String = Me.Sequence
+        Dim privateMode As Boolean = String.StartsWith(body, "?")
+        If privateMode Then body = String.Substring(body, 1)
+        Dim values As Array Of String = String.Split(body, ";")
+        Dim n As Integer = Me.Parameter(values, 0, 1)
+        Me.Wrapped = False
+        Select Case terminator
+        Case 65
+            Me.CursorY = Math.Max(0, Me.CursorY - n)
+        Case 66
+            Me.CursorY = Math.Min(Me.Rows - 1, Me.CursorY + n)
+        Case 67
+            Me.CursorX = Math.Min(Me.Columns - 1, Me.CursorX + n)
+        Case 68
+            Me.CursorX = Math.Max(0, Me.CursorX - n)
+        Case 71
+            Me.CursorX = Math.Min(Me.Columns - 1, n - 1)
+        Case 72, 102
+            Me.CursorY = Math.Min(Me.Rows - 1, n - 1)
+            Me.CursorX = Math.Min(Me.Columns - 1, Me.Parameter(values, 1, 1) - 1)
+        Case 100
+            Me.CursorY = Math.Min(Me.Rows - 1, n - 1)
+        Case 74
+            Dim mode As Integer = Me.Parameter(values, 0, 0)
+            Dim at As Integer = Me.CursorY * Me.Columns + Me.CursorX
+            If mode = 0 Then Me.Erase(at, Array.Count(Me.Cells) - 1)
+            If mode = 1 Then Me.Erase(0, at)
+            If mode = 2 Or mode = 3 Then Me.Erase(0, Array.Count(Me.Cells) - 1)
+            If mode = 3 Then Me.ClearHistory()
+        Case 75
+            Dim mode As Integer = Me.Parameter(values, 0, 0)
+            Dim first As Integer = Me.CursorY * Me.Columns
+            If mode = 0 Then Me.Erase(first + Me.CursorX, first + Me.Columns - 1)
+            If mode = 1 Then Me.Erase(first, first + Me.CursorX)
+            If mode = 2 Then Me.Erase(first, first + Me.Columns - 1)
+        Case 99
+            If String.Len(Me.Replies) < 4096 Then Me.Replies += String.Chr(27) + "[?1;2c"
+        Case 110
+            If Not privateMode And String.Len(Me.Replies) < 4096 Then
+                If n = 5 Then Me.Replies += String.Chr(27) + "[0n"
+                If n = 6 Then Me.Replies += String.Chr(27) + "[" + String.From(Me.CursorY + 1) + ";" + String.From(Me.CursorX + 1) + "R"
+            End If
+        Case 109
+            Me.SGR(values)
+        Case 114
+            Me.ScrollTop = Math.Min(Me.Rows - 2, n - 1)
+            Me.ScrollBottom = Math.Max(Me.ScrollTop + 1, Math.Min(Me.Rows - 1, Me.Parameter(values, 1, Me.Rows) - 1))
+            Me.CursorX = 0
+            Me.CursorY = 0
+        Case 115
+            Me.SavedX = Me.CursorX
+            Me.SavedY = Me.CursorY
+        Case 117
+            Me.CursorX = Me.SavedX
+            Me.CursorY = Me.SavedY
+        Case 104, 108
+            If privateMode Then
+                For Each item As String In values
+                    If item = "25" Then Me.CursorVisible = terminator = 104
+                    If item = "1" Then Me.ApplicationCursor = terminator = 104
+                    If item = "2004" Then Me.BracketedPaste = terminator = 104
+                    If item = "1049" Then
+                        If terminator = 104 And Array.Count(Me.Alternate) = 0 Then
+                            Me.Alternate = Me.Cells
+                            Me.AlternateX = Me.CursorX
+                            Me.AlternateY = Me.CursorY
+                            Me.Cells = []
+                            For i As Integer = 0 To Me.Columns * Me.Rows - 1
+                                Array.Append(Me.Cells, New TerminalCell())
+                            Next
+                            Me.CursorX = 0
+                            Me.CursorY = 0
+                        ElseIf terminator = 108 And Array.Count(Me.Alternate) > 0 Then
+                            Me.Cells = Me.Alternate
+                            Me.Alternate = []
+                            Me.CursorX = Me.AlternateX
+                            Me.CursorY = Me.AlternateY
+                        End If
+                    End If
+                Next
+            End If
+        End Select
+    End Sub
+    Private Sub SGR(values As Array Of String)
+        Dim i As Integer = 0
+        While i < Array.Count(values)
+            Dim n As Integer = Me.Parameter(values, i, 0)
+            Select Case n
+            Case 0
+                Me.Foreground = 7
+                Me.Background = 0
+            Case 1
+                If Me.Foreground < 8 Then Me.Foreground += 8
+            Case 7
+                Dim saved As Integer = Me.Foreground
+                Me.Foreground = Me.Background
+                Me.Background = saved
+            Case 30 To 37
+                Me.Foreground = n - 30
+            Case 40 To 47
+                Me.Background = n - 40
+            Case 90 To 97
+                Me.Foreground = n - 90 + 8
+            Case 100 To 107
+                Me.Background = n - 100 + 8
+            Case 39
+                Me.Foreground = 7
+            Case 49
+                Me.Background = 0
+            Case 38, 48
+                If i + 2 < Array.Count(values) And Me.Parameter(values, i + 1, 0) = 5 Then
+                    Dim color As Integer = Math.Min(255, Me.Parameter(values, i + 2, 0))
+                    If n = 38 Then
+                        Me.Foreground = color
+                    Else
+                        Me.Background = color
+                    End If
+                    i += 2
+                ElseIf i + 4 < Array.Count(values) And Me.Parameter(values, i + 1, 0) = 2 Then
+                    Dim red As Integer = Math.Min(255, Me.Parameter(values, i + 2, 0))
+                    Dim green As Integer = Math.Min(255, Me.Parameter(values, i + 3, 0))
+                    Dim blue As Integer = Math.Min(255, Me.Parameter(values, i + 4, 0))
+                    Dim rgb As Integer = 16777216 + red * 65536 + green * 256 + blue
+                    If n = 38 Then
+                        Me.Foreground = rgb
+                    Else
+                        Me.Background = rgb
+                    End If
+                    i += 4
+                End If
+            End Select
+            i += 1
+        End While
+    End Sub
+    Public Sub Feed(data As Bytes)
+        For byteIndex As Integer = 0 To data.Count - 1
+            Dim n As Integer = data.Item(byteIndex)
+            If Me.State = 5 Then
+                Me.State = 0
+                Continue For
+            End If
+            If Me.State = 3 Then
+                If n = 7 Then Me.State = 0
+                If n = 27 Then Me.State = 4
+                Continue For
+            End If
+            If Me.State = 4 Then
+                If n = 92 Then
+                    Me.State = 0
+                Else
+                    Me.State = 3
+                End If
+                Continue For
+            End If
+            If Me.State = 2 Then
+                If n >= 64 And n <= 126 Then
+                    Me.CSI(n)
+                    Me.State = 0
+                    Me.Sequence = ""
+                ElseIf String.Len(Me.Sequence) < 256 Then
+                    Me.Sequence += String.Chr(n)
+                Else
+                    Me.State = 0
+                    Me.Sequence = ""
+                End If
+                Continue For
+            End If
+            If Me.State = 1 Then
+                Me.State = 0
+                Select Case n
+                Case 91
+                    Me.State = 2
+                    Me.Sequence = ""
+                Case 93
+                    Me.State = 3
+                Case 40, 41
+                    Me.State = 5
+                Case 55
+                    Me.SavedX = Me.CursorX
+                    Me.SavedY = Me.CursorY
+                Case 56
+                    Me.CursorX = Me.SavedX
+                    Me.CursorY = Me.SavedY
+                Case 68
+                    Me.NewLine()
+                Case 77
+                    If Me.CursorY = Me.ScrollTop Then
+                        Me.Scroll(False)
+                    Else
+                        Me.CursorY = Math.Max(0, Me.CursorY - 1)
+                    End If
+                Case 99
+                    Me.Wrapped = False
+                    Me.SavedX = 0
+                    Me.SavedY = 0
+                    Me.ScrollTop = 0
+                    Me.ScrollBottom = Me.Rows - 1
+                    Me.Alternate = []
+                    Me.ClearHistory()
+                    Me.CursorVisible = True
+                    Me.ApplicationCursor = False
+                    Me.BracketedPaste = False
+                    Me.Replies = ""
+                    Me.Foreground = 7
+                    Me.Background = 0
+                    Me.CursorX = 0
+                    Me.CursorY = 0
+                    Me.Erase(0, Array.Count(Me.Cells) - 1)
+                End Select
+                Continue For
+            End If
+            If Me.UTFLeft > 0 Then
+                If n >= 128 And n <= 191 Then
+                    Me.UTFCode = Me.UTFCode * 64 + n - 128
+                    Me.UTFLeft -= 1
+                    If Me.UTFLeft = 0 Then
+                        If Me.UTFCode < Me.UTFMinimum Or Me.UTFCode > 1114111 Or (Me.UTFCode >= 55296 And Me.UTFCode <= 57343) Then Me.UTFCode = 65533
+                        Me.Put(Me.UTFCode)
+                    End If
+                    Continue For
+                Else
+                    Me.UTFLeft = 0
+                    Me.Put(65533)
+                End If
+            End If
+            Select Case n
+            Case 27
+                Me.State = 1
+            Case 13
+                Me.CursorX = 0
+                Me.Wrapped = False
+            Case 10, 11, 12
+                Me.NewLine()
+            Case 8
+                Me.CursorX = Math.Max(0, Me.CursorX - 1)
+                Me.Wrapped = False
+            Case 9
+                Me.CursorX = Math.Min(Me.Columns - 1, (Me.CursorX \ 8 + 1) * 8)
+            Case 32 To 126
+                Me.Put(n)
+            Case 194 To 223
+                Me.UTFCode = n - 192
+                Me.UTFLeft = 1
+                Me.UTFMinimum = 128
+            Case 224 To 239
+                Me.UTFCode = n - 224
+                Me.UTFLeft = 2
+                Me.UTFMinimum = 2048
+            Case 240 To 244
+                Me.UTFCode = n - 240
+                Me.UTFLeft = 3
+                Me.UTFMinimum = 65536
+            Case 128 To 193, 245 To 255
+                Me.Put(65533)
+            End Select
+        Next
+    End Sub
+End Class

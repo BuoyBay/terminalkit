@@ -1,0 +1,28 @@
+{
+  "schema": 2,
+  "target": "x86_64-linux",
+  "source_digest": "589689547723c79575ed06801e712113923f2ef8ffd2f04d62522d3fabcb19a4",
+  "recipe_digest": "6491004184d2ebc3ed4ed2b868cd62793f76269bf60e2ab436e1f60cc121d296",
+  "binary_digest": "9e79b03ea8a993283b643973be3394150f3052fc8c1f58422e8e7c7df8409182",
+  "compiler": {
+    "path": "/usr/bin/x86_64-linux-gnu-gcc-14",
+    "sha256": "a23ecab8ff08f09ad8c80602c2c5df7f49e09c25905cb8975902e101bf72635f"
+  },
+  "compiler_arguments": [
+    "cc"
+  ],
+  "build_host": "x86_64-linux",
+  "builder_machine": "81d93757457f988523814ae0009837ae893f38d3fe123f2c37896f118b4c7804",
+  "environment": {
+    "CC": null,
+    "SDKROOT": null,
+    "MACOSX_DEPLOYMENT_TARGET": null,
+    "INCLUDE": null,
+    "LIB": null,
+    "LIBPATH": null,
+    "CPATH": null,
+    "C_INCLUDE_PATH": null,
+    "CPLUS_INCLUDE_PATH": null,
+    "LIBRARY_PATH": null
+  }
+}

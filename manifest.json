@@ -1,0 +1,1 @@
+{"schema":1,"name":"terminalkit","version":"0.1.0","description":"Interactive PTY and Windows ConPTY sessions with a bounded ANSI terminal grid","libraries":[{"libName":"buoy_terminalkit","system":false,"minVersion":"0.1.0"}]}
