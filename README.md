@@ -1,4 +1,4 @@
-# PTY / ConPTY sessions with an ANSI grid
+# PTY/ConPTY ANSI grid
 
 A real interactive terminal transport: POSIX PTYs on macOS/Linux and ConPTY on
 Windows 10 version 1809 or newer. Shell stdin/stdout/stderr share the terminal;
