@@ -48,13 +48,10 @@ python3 tools/build_terminalkit.py --seal-only
 
 Seal includes only runtime slices whose source receipt matches the current native
 bridge. Six-target compiler checks prove syntax and semantic compatibility; they
-do not prove native target execution. Linux native PTY and Studio GUI smoke tests pass. The full native PTY suite also
-passes on arm64 macOS (m4-casa), including job cleanup and abrupt owner death.
-The sealed model and actual Studio GUI smoke pass there too; six consecutive
-standalone GUI runs also passed after the shutdown correction.
-Intel macOS is built and compiler-checked but has not been executed natively;
-Windows x64 is built and the sealed consumer cross-links, with native Windows
-execution still unverified. Darwin shutdown closes the PTY master before reaping
-the session leader, avoiding a terminal-teardown wait cycle.
+do not prove native target execution. Native PTY behavior is verified on Linux x86_64 and macOS ARM64. Intel macOS
+and additional Windows architectures still require native validation. Rebuild
+source-matched runtime slices for the intended target.
 
-Test suites and fixtures are maintainer-local and are not part of this public repository.
+Builder context: run shared `tools/` commands from the assembled
+[BuoyBay workspace](https://github.com/BuoyBay/workspace-tools). The scripts live
+in [devtools](https://github.com/BuoyBay/devtools), alongside the shared build inputs.
